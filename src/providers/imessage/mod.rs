@@ -1,11 +1,14 @@
 use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::sync::Mutex;
+use tokio::time::{Duration, interval};
 use url::Url;
 
 use crate::audio::ensure_m4a;
@@ -15,6 +18,7 @@ use crate::content::{
 };
 use crate::error::{Result, UnsupportedError};
 use crate::platform::{Message, PlatformMessageRecord, PlatformRuntime, SpaceRef};
+use crate::stream::{ManagedStream, stream};
 use crate::utils::{from_vcard, to_vcard};
 
 pub const IMESSAGE_PLATFORM: &str = "iMessage";
@@ -24,6 +28,9 @@ const MAX_GROUP_TEXT_ITEMS: usize = 1;
 const URL_BALLOON_BUNDLE_ID: &str = "com.apple.messages.URLBalloonProvider";
 const DEFAULT_CACHE_MAX: usize = 1000;
 pub const SHARED_PHONE: &str = "shared";
+const LOCAL_IMESSAGE_PLATFORM: &str = "iMessage (local mode)";
+const DEFAULT_LOCAL_POLL_INTERVAL_MS: u64 = 1_000;
+const ATTACHMENT_PLACEHOLDER: char = '\u{fffc}';
 
 pub type AttachmentGuid = String;
 pub type ChatGuid = String;
@@ -223,6 +230,45 @@ pub struct ImessageStreamItem {
     pub values: Vec<PlatformMessageRecord>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalAttachment {
+    pub id: String,
+    pub file_name: Option<String>,
+    pub mime_type: String,
+    pub size_bytes: Option<u64>,
+    pub local_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalMessage {
+    pub id: String,
+    pub chat_id: Option<String>,
+    pub chat_kind: LocalChatKind,
+    pub participant: Option<String>,
+    pub text: Option<String>,
+    pub attachments: Vec<LocalAttachment>,
+    pub has_attachments: bool,
+    pub kind: LocalMessageKind,
+    pub reaction: Option<String>,
+    pub retracted: bool,
+    pub created_at_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalChatKind {
+    Dm,
+    Group,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalMessageKind {
+    Text,
+    Other,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ImessageReaction {
     Love,
@@ -306,6 +352,131 @@ pub trait ImessageRemoteApi: Send + Sync {
     async fn set_background(&self, chat: &str, data: Bytes) -> Result<()>;
 
     async fn remove_background(&self, chat: &str) -> Result<()>;
+}
+
+#[async_trait]
+pub trait LocalImessageApi: Send + Sync {
+    async fn send_text(&self, to: &str, text: &str) -> Result<()>;
+
+    async fn send_attachment(&self, to: &str, path: &Path) -> Result<()>;
+
+    async fn messages_since(&self, after_ms: u64, limit: usize) -> Result<Vec<LocalMessage>>;
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AppleScriptImessageApi;
+
+#[async_trait]
+impl LocalImessageApi for AppleScriptImessageApi {
+    async fn send_text(&self, to: &str, text: &str) -> Result<()> {
+        let script = format!(
+            r#"tell application "Messages"
+    set targetService to 1st service whose service type = iMessage
+    set targetBuddy to buddy {} of targetService
+    send {} to targetBuddy
+end tell"#,
+            applescript_string(to),
+            applescript_string(text)
+        );
+        run_osascript(&script).await
+    }
+
+    async fn send_attachment(&self, to: &str, path: &Path) -> Result<()> {
+        let path = path.to_string_lossy();
+        let script = format!(
+            r#"tell application "Messages"
+    set targetService to 1st service whose service type = iMessage
+    set targetBuddy to buddy {} of targetService
+    send POSIX file {} to targetBuddy
+end tell"#,
+            applescript_string(to),
+            applescript_string(&path)
+        );
+        run_osascript(&script).await
+    }
+
+    async fn messages_since(&self, _after_ms: u64, _limit: usize) -> Result<Vec<LocalMessage>> {
+        Err(UnsupportedError::action(
+            "messages_since",
+            Some(LOCAL_IMESSAGE_PLATFORM.to_string()),
+            Some("chat.db reading is not implemented by AppleScriptImessageApi; provide a LocalImessageApi backed by chat.db".to_string()),
+        )
+        .into())
+    }
+}
+
+#[derive(Clone)]
+pub struct LocalImessageClient<A> {
+    api: Arc<A>,
+    poll_interval: Duration,
+    poll_limit: usize,
+}
+
+impl<A> LocalImessageClient<A> {
+    pub fn new(api: Arc<A>) -> Self {
+        Self {
+            api,
+            poll_interval: Duration::from_millis(DEFAULT_LOCAL_POLL_INTERVAL_MS),
+            poll_limit: 100,
+        }
+    }
+
+    pub fn with_poll_interval(mut self, interval: Duration) -> Self {
+        self.poll_interval = interval;
+        self
+    }
+
+    pub fn with_poll_limit(mut self, limit: usize) -> Self {
+        self.poll_limit = limit.max(1);
+        self
+    }
+}
+
+impl<A> LocalImessageClient<A>
+where
+    A: LocalImessageApi + 'static,
+{
+    pub async fn send(
+        &self,
+        space_id: &str,
+        content: impl Into<ContentInput>,
+    ) -> Result<PlatformMessageRecord> {
+        send_local_imessage_content(self.api.as_ref(), space_id, content.into().resolve().await?)
+            .await
+    }
+
+    pub fn messages(&self) -> ManagedStream<PlatformMessageRecord> {
+        local_imessage_poll_stream(self.api.clone(), self.poll_interval, self.poll_limit)
+    }
+}
+
+#[derive(Clone)]
+pub struct LocalImessageRuntime<A> {
+    client: LocalImessageClient<A>,
+}
+
+impl<A> LocalImessageRuntime<A> {
+    pub fn new(client: LocalImessageClient<A>) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait]
+impl<A> PlatformRuntime for LocalImessageRuntime<A>
+where
+    A: LocalImessageApi + 'static,
+{
+    fn name(&self) -> &str {
+        LOCAL_IMESSAGE_PLATFORM
+    }
+
+    async fn send(
+        &self,
+        space: &SpaceRef,
+        content: Content,
+    ) -> Result<Option<PlatformMessageRecord>> {
+        self.client.send(&space.id, content).await.map(Some)
+    }
 }
 
 #[derive(Clone)]
@@ -695,6 +866,101 @@ pub async fn to_imessage_inbound_messages(
             .await?;
     cache_imessage_message(cache, message.clone());
     Ok(vec![message])
+}
+
+pub async fn local_message_to_records(message: LocalMessage) -> Result<Vec<PlatformMessageRecord>> {
+    let Some(chat_id) = &message.chat_id else {
+        return Ok(Vec::new());
+    };
+    if message.chat_kind == LocalChatKind::Unknown
+        || message.reaction.is_some()
+        || message.kind != LocalMessageKind::Text
+        || message.retracted
+        || is_pending_local_attachment_join(&message)
+    {
+        return Ok(Vec::new());
+    }
+
+    let base_space = local_space_ref(chat_id, &message.chat_kind);
+    let sender = Some(crate::platform::User {
+        id: message.participant.clone().unwrap_or_default(),
+        platform: LOCAL_IMESSAGE_PLATFORM.to_string(),
+        kind: None,
+        extra: Map::new(),
+    });
+
+    if !message.attachments.is_empty() {
+        let mut records = Vec::with_capacity(message.attachments.len());
+        for attachment in &message.attachments {
+            records.push(PlatformMessageRecord {
+                id: format!("{}:{}", message.id, attachment.id),
+                content: local_attachment_content(attachment).await?,
+                sender: sender.clone(),
+                space: base_space.clone(),
+                extra: local_message_extra(message.created_at_ms),
+            });
+        }
+        return Ok(records);
+    }
+
+    Ok(vec![PlatformMessageRecord {
+        id: message.id,
+        content: Content::Text(crate::content::Text {
+            text: message.text.unwrap_or_default(),
+        }),
+        sender,
+        space: base_space,
+        extra: local_message_extra(message.created_at_ms),
+    }])
+}
+
+pub async fn send_local_imessage_content(
+    local: &dyn LocalImessageApi,
+    space_id: &str,
+    content: Content,
+) -> Result<PlatformMessageRecord> {
+    match &content {
+        Content::Text(text) => {
+            local.send_text(space_id, &text.text).await?;
+            Ok(synthetic_local_record(space_id, content))
+        }
+        Content::Attachment(attachment) => {
+            let path = write_temp_local_attachment(&attachment.name, &attachment.data).await?;
+            let result = local.send_attachment(space_id, &path).await;
+            let _ = tokio::fs::remove_file(&path).await;
+            let _ = tokio::fs::remove_dir(path.parent().unwrap_or_else(|| Path::new(""))).await;
+            result?;
+            Ok(synthetic_local_record(space_id, content))
+        }
+        Content::Contact(contact) => {
+            let name = vcard_file_name(contact);
+            let vcf = to_vcard(contact);
+            let path = write_temp_local_attachment(&name, vcf.as_bytes()).await?;
+            let result = local.send_attachment(space_id, &path).await;
+            let _ = tokio::fs::remove_file(&path).await;
+            let _ = tokio::fs::remove_dir(path.parent().unwrap_or_else(|| Path::new(""))).await;
+            result?;
+            Ok(synthetic_local_record(space_id, content))
+        }
+        Content::Effect(_) => Err(UnsupportedError::content(
+            "effect",
+            Some(LOCAL_IMESSAGE_PLATFORM.to_string()),
+            Some("message effects require remote iMessage".to_string()),
+        )
+        .into()),
+        Content::Poll(_) => {
+            Err(
+                UnsupportedError::content("poll", Some(LOCAL_IMESSAGE_PLATFORM.to_string()), None)
+                    .into(),
+            )
+        }
+        other => Err(UnsupportedError::content(
+            other.content_type(),
+            Some(LOCAL_IMESSAGE_PLATFORM.to_string()),
+            None,
+        )
+        .into()),
+    }
 }
 
 pub async fn get_imessage_message(
@@ -1494,6 +1760,158 @@ fn imessage_space_ref(chat_guid: &str, phone: &str) -> SpaceRef {
     }
 }
 
+fn local_space_ref(chat_id: &str, chat_kind: &LocalChatKind) -> SpaceRef {
+    let mut extra = Map::new();
+    extra.insert(
+        "type".to_string(),
+        Value::String(
+            match chat_kind {
+                LocalChatKind::Group => "group",
+                LocalChatKind::Dm => "dm",
+                LocalChatKind::Unknown => "unknown",
+            }
+            .to_string(),
+        ),
+    );
+    extra.insert("phone".to_string(), Value::String(String::new()));
+    SpaceRef {
+        id: chat_id.to_string(),
+        platform: LOCAL_IMESSAGE_PLATFORM.to_string(),
+        extra,
+    }
+}
+
+fn local_message_extra(created_at_ms: u64) -> Map<String, Value> {
+    let mut extra = Map::new();
+    extra.insert("createdAtMs".to_string(), json!(created_at_ms));
+    extra
+}
+
+fn is_pending_local_attachment_join(message: &LocalMessage) -> bool {
+    message.attachments.is_empty()
+        && (message.has_attachments
+            || message
+                .text
+                .as_ref()
+                .is_some_and(|text| text.contains(ATTACHMENT_PLACEHOLDER)))
+}
+
+async fn local_attachment_content(attachment: &LocalAttachment) -> Result<Content> {
+    if is_vcard_attachment(Some(&attachment.mime_type), attachment.file_name.as_deref())
+        && let Ok(data) = read_local_attachment(attachment).await
+        && let Ok(text) = std::str::from_utf8(&data)
+        && let Ok(contact) = from_vcard(text)
+    {
+        return Ok(Content::Contact(Box::new(contact)));
+    }
+
+    let data = read_local_attachment(attachment).await?;
+    Ok(Content::Attachment(Attachment {
+        name: attachment
+            .file_name
+            .clone()
+            .unwrap_or_else(|| "attachment".to_string()),
+        mime_type: attachment.mime_type.clone(),
+        size: attachment.size_bytes.or(Some(data.len() as u64)),
+        data,
+    }))
+}
+
+async fn read_local_attachment(attachment: &LocalAttachment) -> Result<Bytes> {
+    let Some(path) = &attachment.local_path else {
+        return Err(crate::error::SpectrumError::msg(format!(
+            "iMessage attachment {} has no local file available on disk",
+            attachment.id
+        )));
+    };
+    Ok(Bytes::from(tokio::fs::read(path).await?))
+}
+
+fn local_imessage_poll_stream<A>(
+    api: Arc<A>,
+    poll_interval: Duration,
+    poll_limit: usize,
+) -> ManagedStream<PlatformMessageRecord>
+where
+    A: LocalImessageApi + 'static,
+{
+    stream(move |tx, closed| async move {
+        let mut last_seen_ms = 0_u64;
+        let mut ticker = interval(poll_interval);
+        loop {
+            if closed.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            ticker.tick().await;
+            let messages = api.messages_since(last_seen_ms, poll_limit).await?;
+            for message in messages {
+                last_seen_ms = last_seen_ms.max(message.created_at_ms);
+                for record in local_message_to_records(message).await? {
+                    if tx.send(record).await.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+fn synthetic_local_record(space_id: &str, content: Content) -> PlatformMessageRecord {
+    PlatformMessageRecord {
+        id: format!("local:{}", now_nanos()),
+        content,
+        sender: None,
+        space: SpaceRef {
+            id: space_id.to_string(),
+            platform: LOCAL_IMESSAGE_PLATFORM.to_string(),
+            extra: Map::new(),
+        },
+        extra: Map::new(),
+    }
+}
+
+async fn write_temp_local_attachment(name: &str, data: &[u8]) -> Result<PathBuf> {
+    let safe_name = Path::new(name)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "attachment".to_string());
+    let dir = std::env::temp_dir().join(format!("spectrum-local-{}", now_nanos()));
+    tokio::fs::create_dir(&dir).await?;
+    let path = dir.join(safe_name);
+    tokio::fs::write(&path, data).await?;
+    Ok(path)
+}
+
+async fn run_osascript(script: &str) -> Result<()> {
+    let output = tokio::process::Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .await?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(crate::error::SpectrumError::msg(format!(
+        "osascript failed (exit {}): {}",
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stderr)
+    )))
+}
+
+fn applescript_string(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+fn now_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default()
+}
+
 fn is_event_from_current_account(
     is_from_me: bool,
     actor: Option<&ImessageActor>,
@@ -1790,12 +2208,66 @@ mod tests {
         },
     }
 
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum LocalCall {
+        SendText { to: String, text: String },
+        SendAttachment { to: String, path: PathBuf },
+    }
+
     #[derive(Default)]
     struct FakeRemote {
         calls: Arc<Mutex<Vec<Call>>>,
         attachments: Arc<Mutex<HashMap<String, Bytes>>>,
         messages: Arc<Mutex<HashMap<String, AppleMessage>>>,
         polls: Arc<Mutex<HashMap<String, ImessagePollInfo>>>,
+    }
+
+    #[derive(Default)]
+    struct FakeLocal {
+        calls: Arc<Mutex<Vec<LocalCall>>>,
+        messages: Arc<Mutex<Vec<LocalMessage>>>,
+    }
+
+    impl FakeLocal {
+        fn calls(&self) -> Vec<LocalCall> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn with_messages(self, messages: Vec<LocalMessage>) -> Self {
+            *self.messages.lock().unwrap() = messages;
+            self
+        }
+    }
+
+    #[async_trait]
+    impl LocalImessageApi for FakeLocal {
+        async fn send_text(&self, to: &str, text: &str) -> Result<()> {
+            self.calls.lock().unwrap().push(LocalCall::SendText {
+                to: to.to_string(),
+                text: text.to_string(),
+            });
+            Ok(())
+        }
+
+        async fn send_attachment(&self, to: &str, path: &Path) -> Result<()> {
+            self.calls.lock().unwrap().push(LocalCall::SendAttachment {
+                to: to.to_string(),
+                path: path.to_path_buf(),
+            });
+            Ok(())
+        }
+
+        async fn messages_since(&self, after_ms: u64, limit: usize) -> Result<Vec<LocalMessage>> {
+            Ok(self
+                .messages
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|message| message.created_at_ms > after_ms)
+                .take(limit)
+                .cloned()
+                .collect())
+        }
     }
 
     impl FakeRemote {
@@ -3119,6 +3591,197 @@ mod tests {
             panic!("expected poll option");
         };
         assert_eq!(option.title, "Sushi");
+    }
+
+    #[tokio::test]
+    async fn local_message_conversion_filters_unsupported_rows_and_maps_text() {
+        let unsupported = vec![
+            LocalMessage {
+                id: "unknown-chat".to_string(),
+                chat_id: None,
+                chat_kind: LocalChatKind::Dm,
+                participant: Some("+15550001111".to_string()),
+                text: Some("ignored".to_string()),
+                attachments: Vec::new(),
+                has_attachments: false,
+                kind: LocalMessageKind::Text,
+                reaction: None,
+                retracted: false,
+                created_at_ms: 1,
+            },
+            LocalMessage {
+                id: "pending".to_string(),
+                chat_id: Some("chat1".to_string()),
+                chat_kind: LocalChatKind::Dm,
+                participant: Some("+15550001111".to_string()),
+                text: Some(ATTACHMENT_PLACEHOLDER.to_string()),
+                attachments: Vec::new(),
+                has_attachments: true,
+                kind: LocalMessageKind::Text,
+                reaction: None,
+                retracted: false,
+                created_at_ms: 2,
+            },
+            LocalMessage {
+                id: "reaction".to_string(),
+                chat_id: Some("chat1".to_string()),
+                chat_kind: LocalChatKind::Dm,
+                participant: Some("+15550001111".to_string()),
+                text: Some("liked".to_string()),
+                attachments: Vec::new(),
+                has_attachments: false,
+                kind: LocalMessageKind::Text,
+                reaction: Some("like".to_string()),
+                retracted: false,
+                created_at_ms: 3,
+            },
+        ];
+        for message in unsupported {
+            assert!(local_message_to_records(message).await.unwrap().is_empty());
+        }
+
+        let records = local_message_to_records(LocalMessage {
+            id: "m1".to_string(),
+            chat_id: Some("chat1".to_string()),
+            chat_kind: LocalChatKind::Group,
+            participant: Some("+15550001111".to_string()),
+            text: Some("hello".to_string()),
+            attachments: Vec::new(),
+            has_attachments: false,
+            kind: LocalMessageKind::Text,
+            reaction: None,
+            retracted: false,
+            created_at_ms: 4,
+        })
+        .await
+        .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, "m1");
+        assert_eq!(records[0].space.extra["type"], json!("group"));
+        assert_eq!(records[0].extra["createdAtMs"], json!(4));
+        assert!(matches!(records[0].content, Content::Text(_)));
+    }
+
+    #[tokio::test]
+    async fn local_attachment_conversion_reads_files_and_vcards() {
+        let dir = std::env::temp_dir().join(format!("spectrum-test-{}", now_nanos()));
+        tokio::fs::create_dir(&dir).await.unwrap();
+        let txt = dir.join("note.txt");
+        let vcf = dir.join("person.vcf");
+        tokio::fs::write(&txt, b"hello").await.unwrap();
+        tokio::fs::write(
+            &vcf,
+            b"BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Jane Doe\r\nEND:VCARD\r\n",
+        )
+        .await
+        .unwrap();
+
+        let records = local_message_to_records(LocalMessage {
+            id: "m2".to_string(),
+            chat_id: Some("chat1".to_string()),
+            chat_kind: LocalChatKind::Dm,
+            participant: Some("+15550001111".to_string()),
+            text: None,
+            attachments: vec![
+                LocalAttachment {
+                    id: "a1".to_string(),
+                    file_name: Some("note.txt".to_string()),
+                    mime_type: "text/plain".to_string(),
+                    size_bytes: Some(5),
+                    local_path: Some(txt),
+                },
+                LocalAttachment {
+                    id: "a2".to_string(),
+                    file_name: Some("person.vcf".to_string()),
+                    mime_type: "text/vcard".to_string(),
+                    size_bytes: None,
+                    local_path: Some(vcf),
+                },
+            ],
+            has_attachments: true,
+            kind: LocalMessageKind::Text,
+            reaction: None,
+            retracted: false,
+            created_at_ms: 5,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].id, "m2:a1");
+        let Content::Attachment(attachment) = &records[0].content else {
+            panic!("expected attachment");
+        };
+        assert_eq!(attachment.data, Bytes::from_static(b"hello"));
+        assert!(matches!(records[1].content, Content::Contact(_)));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn local_client_sends_text_and_attachments() {
+        let api = Arc::new(FakeLocal::default());
+        let client = LocalImessageClient::new(api.clone());
+
+        let text_record = client.send("chat1", "hello").await.unwrap();
+        assert!(text_record.id.starts_with("local:"));
+        assert_eq!(
+            api.calls()[0],
+            LocalCall::SendText {
+                to: "chat1".to_string(),
+                text: "hello".to_string()
+            }
+        );
+
+        let attachment = attachment(Bytes::from_static(b"file"))
+            .options(crate::content::AttachmentOptions {
+                name: Some("file.txt".to_string()),
+                mime_type: Some("text/plain".to_string()),
+            })
+            .build()
+            .await
+            .unwrap();
+        client.send("chat1", attachment).await.unwrap();
+        assert!(matches!(api.calls()[1], LocalCall::SendAttachment { .. }));
+
+        let poll = Content::Poll(Poll {
+            title: "pick".to_string(),
+            options: vec![
+                PollChoice {
+                    title: "a".to_string(),
+                },
+                PollChoice {
+                    title: "b".to_string(),
+                },
+            ],
+        });
+        let err = client.send("chat1", poll).await.unwrap_err();
+        assert!(err.to_string().contains("does not support content type"));
+    }
+
+    #[tokio::test]
+    async fn local_poller_emits_new_rows() {
+        let api = Arc::new(FakeLocal::default().with_messages(vec![LocalMessage {
+            id: "m1".to_string(),
+            chat_id: Some("chat1".to_string()),
+            chat_kind: LocalChatKind::Dm,
+            participant: Some("+15550001111".to_string()),
+            text: Some("hello".to_string()),
+            attachments: Vec::new(),
+            has_attachments: false,
+            kind: LocalMessageKind::Text,
+            reaction: None,
+            retracted: false,
+            created_at_ms: 10,
+        }]));
+        let client = LocalImessageClient::new(api).with_poll_interval(Duration::from_millis(1));
+        let mut stream = client.messages();
+        let record = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.id, "m1");
+        stream.close().await;
     }
 
     #[test]

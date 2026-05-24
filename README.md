@@ -9,5 +9,8 @@ This crate currently contains the core Spectrum model:
 - in-memory store and identifier helpers
 - vCard import/export helpers
 - stream fanout helpers
+- trait-backed Slack, WhatsApp Business, terminal, and iMessage provider slices
+- iMessage remote send/inbound/event/runtime helpers
+- iMessage local-mode helpers: AppleScript text/attachment sender plus a typed polling interface for chat.db-backed rows
 
-Provider integrations are being ported after the shared runtime surface is in place.
+The local iMessage poller is intentionally split at the storage boundary: apps can provide a `LocalImessageApi` implementation backed by chat.db, while the crate handles row-to-Spectrum conversion, polling, local sends, and runtime integration.
