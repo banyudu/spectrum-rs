@@ -1,0 +1,22 @@
+[package]
+name = "spectrum-rs"
+version = "0.1.0"
+edition = "2024"
+description = "Rust port of the Spectrum unified messaging SDK"
+license = "MIT"
+
+[dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+bytes = { version = "1", features = ["serde"] }
+futures = "0.3"
+mime_guess = "2"
+once_cell = "1"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+url = "2"
