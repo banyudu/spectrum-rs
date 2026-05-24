@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 description = "Rust port of the Spectrum unified messaging SDK"
 license = "MIT"
+repository = "https://github.com/banyudu/spectrum-rs"
+homepage = "https://github.com/banyudu/spectrum-rs"
+readme = "README.md"
+keywords = ["messaging", "slack", "whatsapp", "imessage", "sdk"]
+categories = ["api-bindings", "asynchronous"]
 
 [dependencies]
 async-trait = "0.1"
